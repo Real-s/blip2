@@ -6,4 +6,4 @@ __pycache__/
 test/
 LEARNING_PLAN.md
 data/Image
-outputs
+outputs/checkpoints
