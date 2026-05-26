@@ -3,6 +3,7 @@ from torchvision import transforms
 from torch.utils.data import Dataset
 from PIL import Image
 import os
+import random
 
 #Flickr数据读取
 class FlickrDataset(Dataset):
@@ -11,18 +12,23 @@ class FlickrDataset(Dataset):
         self.caption_dir = caption_dir
         self.trans = trans
         self.root_dir = root_dir #data/image
-        self.img_path = os.listdir(self.root_dir)
+        self.img_path = sorted(os.listdir(self.root_dir))
         self.trans_tensor = transforms.ToTensor()
         self.trans_Resize = transforms.Resize((256,256))
         self.resize = resize
         with open(self.caption_dir, encoding="utf-8") as f:
-            self.caption_lines = f.readlines()
+            caption_lines = f.readlines()
+
+        self.caption_map = {}
+        for line in caption_lines[1:]:
+            image_name, caption_temp = line.split(",", 1) #split将一句话从','分割
+            caption_temp = caption_temp.strip() # 去除’\n'
+            self.caption_map.setdefault(image_name, []).append(caption_temp)
 
     def __getitem__(self, idx):
         image_name = self.img_path[idx]
-        caption = []
         img_item_path = os.path.join(self.root_dir,image_name)
-        img = Image.open(img_item_path)
+        img = Image.open(img_item_path).convert("RGB")
 
         if self.trans:
             img = self.trans_tensor(img)
@@ -30,10 +36,7 @@ class FlickrDataset(Dataset):
         if self.resize:
             img = self.trans_Resize(img)
 
-        for line in range(5 * idx + 1,5 * idx + 6):
-            caption_img,caption_temp = self.caption_lines[line].split(",",1) #split将一句话从','分割
-            caption_temp = caption_temp.strip() # 去除’\n'
-            caption.append(caption_temp) #将句子读取到caption
+        caption = random.choice(self.caption_map[image_name])
 
         return img,caption
 

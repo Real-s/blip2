@@ -1,11 +1,15 @@
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel , CLIPImageProcessor
-from dataset import FlickrDataset
 from transformers import OPTForCausalLM, AutoTokenizer
 
+try:
+    from dataset import FlickrDataset
+except ImportError:
+    from .dataset import FlickrDataset
+
 class CLIPVisionEncoder(nn.Module):
-    def __init__(self , model_name):
+    def __init__(self , model_name="openai/clip-vit-base-patch32"):
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.imageprocessor = CLIPImageProcessor.from_pretrained(model_name) #CLIP图像预处理
@@ -79,19 +83,19 @@ class MiniQFormer(nn.Module):
     """
     Q-Former
     """
-    def __init__(self):
+    def __init__(self, num_query_tokens=32, hidden_dim=768, num_heads=8, num_layers=2):
         super().__init__()
         #创建32个空白问题
         self.query_tokens = nn.Parameter(
-            torch.randn(1, 32, 768)
+            torch.randn(1, num_query_tokens, hidden_dim)
         )
         # 让query token 读取 image token
         self.layers = nn.ModuleList([
-            MiniQFormerLayer(768, 8),
-            MiniQFormerLayer(768, 8)
+            MiniQFormerLayer(hidden_dim, num_heads)
+            for _ in range(num_layers)
         ])
         #设定projection layer 对齐向量
-        self.llm_proj = nn.Linear(768, 768)
+        self.llm_proj = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, image_embeds):
 
@@ -111,22 +115,24 @@ class MiniOPT(nn.Module):
     """
     加载OPT模型并冻结
     """
-    def __init__(self):
+    def __init__(self, model_name="facebook/opt-125m"):
         super().__init__()
 
-        self.opt_model = OPTForCausalLM.from_pretrained("facebook/opt-125m")
-        self.opt_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m")
+        self.opt_model = OPTForCausalLM.from_pretrained(model_name)
+        self.opt_tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.opt_tokenizer.pad_token = self.opt_tokenizer.eos_token
 
         for p in self.opt_model.parameters():
             p.requires_grad = False
 
-    def forward(self,qformer_output, caption):
+    def forward(self, qformer_output, caption):
         device = qformer_output.device
 
         tokens = self.opt_tokenizer(
             caption,
             padding=True,
+            truncation=True,
+            max_length=32,
             return_tensors="pt"
         ).to(device)
 
@@ -151,12 +157,104 @@ class MiniOPT(nn.Module):
             dim=1
         )
 
+        text_labels = input_ids.clone()
+        text_labels[text_attention_mask == 0] = -100
+
+        qformer_labels = torch.full(
+            qformer_output.size()[:-1],
+            -100,
+            dtype=torch.long,
+            device=device
+        )
+
+        labels = torch.cat(
+            [qformer_labels, text_labels],
+            dim=1
+        )
+
         outputs = self.opt_model(
             inputs_embeds=inputs_embeds,
-            attention_mask = attention_mask
+            attention_mask=attention_mask,
+            labels=labels
         )
 
         return outputs
+
+    @torch.no_grad()
+    def generate_caption(self, qformer_output, max_new_tokens=30, prompt="A photo of"):
+        device = qformer_output.device
+        batch_size = qformer_output.size(0)
+        prompts = [prompt] * batch_size
+        prompt_tokens = self.opt_tokenizer(
+            prompts,
+            padding=True,
+            return_tensors="pt"
+        ).to(device)
+        prompt_embeds = self.opt_model.get_input_embeddings()(prompt_tokens.input_ids)
+
+        inputs_embeds = torch.cat(
+            [qformer_output, prompt_embeds],
+            dim=1
+        )
+
+        qformer_attention_mask = torch.ones(
+            qformer_output.size()[:-1],
+            dtype=torch.long,
+            device=device
+        )
+        attention_mask = torch.cat(
+            [qformer_attention_mask, prompt_tokens.attention_mask],
+            dim=1
+        )
+
+        generated_ids = self.opt_model.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.2,
+            pad_token_id=self.opt_tokenizer.eos_token_id,
+            eos_token_id=self.opt_tokenizer.eos_token_id
+        )
+
+        captions = self.opt_tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )
+        return [caption.strip() for caption in captions]
+
+
+class MiniBLIP2(nn.Module):
+    """
+    简化版 BLIP-2: frozen CLIP -> trainable Mini Q-Former -> frozen OPT.
+    """
+    def __init__(
+        self,
+        vision_model_name="openai/clip-vit-base-patch32",
+        opt_model_name="facebook/opt-125m"
+    ):
+        super().__init__()
+        self.vision_encoder = CLIPVisionEncoder(vision_model_name)
+        self.qformer = MiniQFormer()
+        self.opt = MiniOPT(opt_model_name)
+
+    def forward(self, images, captions):
+        image_embeds = self.vision_encoder(images)
+        image_embeds = image_embeds.to(next(self.qformer.parameters()).device)
+        qformer_output = self.qformer(image_embeds)
+        return self.opt(qformer_output, captions)
+
+    @torch.no_grad()
+    def generate_caption(self, images, max_new_tokens=20, prompt="A photo of"):
+        image_embeds = self.vision_encoder(images)
+        image_embeds = image_embeds.to(next(self.qformer.parameters()).device)
+        qformer_output = self.qformer(image_embeds)
+        return self.opt.generate_caption(
+            qformer_output,
+            max_new_tokens=max_new_tokens,
+            prompt=prompt
+        )
 
 
 
@@ -167,23 +265,11 @@ if __name__ == "__main__":
     Caption_dir = "../data/captions.txt"
     FlickrData = FlickrDataset(Root_dir,Caption_dir)
 
-    encoder = CLIPVisionEncoder("openai/clip-vit-base-patch32")
+    model = MiniBLIP2().to(device)
     img , caption = FlickrData[0]
-    image_embeds  = encoder(img).to(device)
-
-    trans_qformer = MiniQFormer().to(device)
-    q_out  = trans_qformer(image_embeds)
-
-    # print(trans_qformer.llm_proj)
-    #
-    # for name, p in trans_qformer.named_parameters():
-    #     if "llm_proj" in name:
-    #         print(name, p.requires_grad)
-
-    opt_model = MiniOPT().to(device)
-
-    outputs = opt_model(q_out,["a cat on the grass"])
+    outputs = model([img], [caption])
     print(outputs.logits.shape)
+    print(outputs.loss.item())
 
 
 
