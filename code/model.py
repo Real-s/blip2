@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel , CLIPImageProcessor
 from dataset import FlickrDataset
+from transformers import OPTForCausalLM, AutoTokenizer
 
 class CLIPVisionEncoder(nn.Module):
     def __init__(self , model_name):
@@ -75,7 +76,9 @@ class MiniQFormerLayer(nn.Module):
 
 
 class MiniQFormer(nn.Module):
-
+    """
+    Q-Former
+    """
     def __init__(self):
         super().__init__()
         #创建32个空白问题
@@ -104,6 +107,58 @@ class MiniQFormer(nn.Module):
         return query_tokens
 
 
+class MiniOPT(nn.Module):
+    """
+    加载OPT模型并冻结
+    """
+    def __init__(self):
+        super().__init__()
+
+        self.opt_model = OPTForCausalLM.from_pretrained("facebook/opt-125m")
+        self.opt_tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m")
+        self.opt_tokenizer.pad_token = self.opt_tokenizer.eos_token
+
+        for p in self.opt_model.parameters():
+            p.requires_grad = False
+
+    def forward(self,qformer_output, caption):
+        device = qformer_output.device
+
+        tokens = self.opt_tokenizer(
+            caption,
+            padding=True,
+            return_tensors="pt"
+        ).to(device)
+
+        input_ids = tokens.input_ids
+        text_attention_mask  = tokens.attention_mask
+
+        text_embeds = self.opt_model.get_input_embeddings()(input_ids)
+
+        inputs_embeds = torch.cat(
+            [qformer_output , text_embeds],
+             dim = 1
+        )
+
+        qformer_attention_mask = torch.ones(
+            qformer_output.size()[:-1],
+            dtype=torch.long,
+            device = device
+        )
+
+        attention_mask = torch.cat(
+            [qformer_attention_mask, text_attention_mask],
+            dim=1
+        )
+
+        outputs = self.opt_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask = attention_mask
+        )
+
+        return outputs
+
+
 
 # 测试代码
 if __name__ == "__main__":
@@ -114,47 +169,25 @@ if __name__ == "__main__":
 
     encoder = CLIPVisionEncoder("openai/clip-vit-base-patch32")
     img , caption = FlickrData[0]
-    image_embeds  = encoder(img)
+    image_embeds  = encoder(img).to(device)
 
     trans_qformer = MiniQFormer().to(device)
     q_out  = trans_qformer(image_embeds)
 
-    print(trans_qformer.llm_proj)
-
-    for name, p in trans_qformer.named_parameters():
-        if "llm_proj" in name:
-            print(name, p.requires_grad)
-
-    # optimizer = torch.optim.AdamW(
-    #     trans_qformer.parameters(),
-    #     lr=1e-4
-    # )
-    # loss = q_out.mean()
+    # print(trans_qformer.llm_proj)
     #
-    # for step in range(20):
-    #     image_embeds = encoder(img)
-    #
-    #     q_out = trans_qformer(image_embeds)
-    #
-    #     loss = q_out.mean()
-    #
-    #     optimizer.zero_grad()
-    #
-    #     loss.backward()
-    #
-    #     optimizer.step()
-    #
-    #     print(f"step:{step} loss:{loss.item()}")
-
-
-
-
     # for name, p in trans_qformer.named_parameters():
-    #     print(name, p.requires_grad)
-    # print(image_embeds.shape)
-    # print(q_out.shape)
-    # output = encoder(img)
-    # print(output.shape)
+    #     if "llm_proj" in name:
+    #         print(name, p.requires_grad)
+
+    opt_model = MiniOPT().to(device)
+
+    outputs = opt_model(q_out,["a cat on the grass"])
+    print(outputs.logits.shape)
+
+
+
+
 
 
 
